@@ -1,250 +1,471 @@
 -- [Q:GRAY] [AC:HYPERION-LOW] [GAME-AC:LOW]
--- [EXEC:DELTA] [PLATFORM:ANDROID] [ZONA:2] [API-VER:2026-11]
--- [ADAPTIVE:yes] [FALLBACK:packets.send -> :send -> ByteNetReliable | GUI click -> packet]
-local genv = (getgenv and getgenv()) or _G
-local UI = genv.ZPOST_GUI
-if not UI then return warn("[zpost] jalankan K Hub dulu, GUI belum ada") end
-if genv.ZPOST_EVO then pcall(genv.ZPOST_EVO) end
+-- [EXEC:DELTA/GENERIC] [PLATFORM:ANDROID/IOS/PC] [ZONA:2] [API-VER:2026-11]
+-- [ADAPTIVE:yes] [FALLBACK:gethui->CoreGui->PlayerGui | packets->ByteNetReliable | GUI click->packet]
+-- K Hub | Azure Latch  (UI + Fast Auto-Pickup + Auto Position)
 
 local Players = game:GetService("Players")
-local RS = game:GetService("ReplicatedStorage")
-local WS = game:GetService("Workspace")
-local RunService = game:GetService("RunService")
-local LP = Players.LocalPlayer
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local CoreGui = game:GetService("CoreGui")
 
-local cleanup, alive = {}, true
+local genv = (getgenv and getgenv()) or _G
+if genv.ZPOST_GUI and genv.ZPOST_GUI.Unload then pcall(genv.ZPOST_GUI.Unload) end
+
+local cleanup = {}
 local function safe(fn, ...)
     local ok, err = pcall(fn, ...)
     if not ok then warn("[zpost-Q] " .. tostring(err)) end
     return ok, err
 end
-local function unload()
-    alive = false
+local function cleanupAll()
     for _, f in ipairs(cleanup) do safe(f) end
     cleanup = {}
-    genv.ZPOST_EVO = nil
 end
-genv.ZPOST_EVO = unload
-
--- ===== packets =====
-local packets
-local function getPackets()
-    if packets then return packets end
-    safe(function()
-        local m = RS:FindFirstChild("packets") or RS:FindFirstChild("packets", true)
-        if not m then return end
-        local r = require(m)
-        if type(r) == "table" and (r.bytenet_findBall or r.bytenet_selectRole) then packets = r end
-    end)
-    return packets
-end
-local function send(name, ...)
-    local p = getPackets()
-    local pk = p and p[name]
-    if not pk then return false end
-    local a = table.pack(...)
-    if pcall(function() pk.send(table.unpack(a, 1, a.n)) end) then return true end
-    return (pcall(function() pk:send(table.unpack(a, 1, a.n)) end))
-end
-local function findBallRemote() -- fallback kalau require nggak jalan
-    local r = RS:FindFirstChild("ByteNetReliable") or RS:FindFirstChild("Reliable", true)
-    if not r or not buffer then return false end
-    local id = 29
-    safe(function()
-        local s = RS:FindFirstChild("BytenetStorage")
-        local n = s and s:FindFirstChild("Networking")
-        local d = n and game:GetService("HttpService"):JSONDecode(n.Value)
-        if d and d.packets and d.packets.bytenet_findBall then id = d.packets.bytenet_findBall end
-    end)
-    return (pcall(function() r:FireServer(buffer.fromstring(string.char(id))) end))
+local function track(conn)
+    cleanup[#cleanup + 1] = function() conn:Disconnect() end
+    return conn
 end
 
--- ===== helpers =====
-local function hasBall()
-    local w = RS:FindFirstChild("workspace")
-    local holder = w and w:FindFirstChild("ballHolder")
-    if holder and holder.Value and holder.Value == LP.Character then return true end
-    local chars = WS:FindFirstChild("characters")
-    local c = chars and chars:FindFirstChild(LP.Name)
-    return c ~= nil and (c:FindFirstChild("Ball") ~= nil or c:FindFirstChild("AlternateBallRig") ~= nil)
-end
-local function ballPos()
-    local cf = RS:FindFirstChild("CFBall")
-    if cf and cf:IsA("CFrameValue") then return cf.Value.Position end
-    local t = WS:FindFirstChild("Terrain")
-    local b = (t and (t:FindFirstChild("Ball") or t:FindFirstChild("MarbleStuckBall"))) or WS:FindFirstChild("Ball")
-    if b and b:IsA("BasePart") then return b.Position end
-end
+local IS_MOBILE = UIS.TouchEnabled and not UIS.KeyboardEnabled
+genv.ZPOST_MOBILE = IS_MOBILE
+local EXEC = "unknown"
+safe(function() EXEC = tostring(identifyexecutor and identifyexecutor() or "unknown") end)
 
--- ===== FAST AUTO-PICKUP =====
-local MAX_RANGE = 15
-local fp = { on = false, show = false, range = 12 }
-local RESTRICTED = {
-    ["81249694116204"] = true, ["115839777221212"] = true, ["127428631641330"] = true,
-    ["97586424269981"] = true, ["133565559497234"] = true, ["79074253499106"] = true,
+local C = {
+    bg = Color3.fromRGB(24, 24, 30), title = Color3.fromRGB(32, 32, 40),
+    row = Color3.fromRGB(36, 36, 46), tab = Color3.fromRGB(30, 30, 38),
+    accent = Color3.fromRGB(110, 120, 255), off = Color3.fromRGB(70, 70, 84),
+    text = Color3.fromRGB(235, 235, 245), sub = Color3.fromRGB(150, 150, 170),
 }
-local function restricted(hum)
-    local an = hum:FindFirstChildOfClass("Animator")
-    if not an then return false end
-    for _, tr in ipairs(an:GetPlayingAnimationTracks()) do
-        local id = tr.Animation and tostring(tr.Animation.AnimationId):match("%d+")
-        if id and RESTRICTED[id] then return true end
-    end
-    return false
+
+local function new(class, props, parent)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    o.Parent = parent
+    return o
 end
+local function corner(o, r) new("UICorner", { CornerRadius = UDim.new(0, r) }, o) end
 
-local ring = Instance.new("Part")
-ring.Anchored, ring.CanCollide, ring.CanQuery, ring.CanTouch = true, false, false, false
-ring.Shape, ring.Material, ring.Transparency = Enum.PartType.Cylinder, Enum.Material.Neon, 1
-ring.Color, ring.Size = Color3.fromRGB(70, 190, 255), Vector3.new(0.1, 1, 1)
-ring.Parent = WS
-cleanup[#cleanup + 1] = function() ring:Destroy() end
+-- ScreenGui (fallback chain)
+local gui = Instance.new("ScreenGui")
+gui.Name = "ZpostUI"
+gui.ResetOnSpawn = false
+gui.DisplayOrder = 999
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+if protectgui then pcall(protectgui, gui) elseif syn and syn.protect_gui then pcall(syn.protect_gui, gui) end
 
-local lastPick, warned = 0, false
-local function pickupStep()
-    local char = LP.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if hrp and fp.show then
-        local d = fp.range * 2
-        ring.Size = Vector3.new(0.1, d, d)
-        ring.CFrame = CFrame.new(hrp.Position - Vector3.new(0, 3.2, 0)) * CFrame.Angles(0, 0, math.rad(90))
-        ring.Transparency = 0.75
-    else
-        ring.Transparency = 1
-    end
-    if not fp.on or not hrp then return end
-    local now = os.clock()
-    if now - lastPick < 0.08 + math.random() * 0.02 then return end
-    local hum = char:FindFirstChildOfClass("Humanoid")
-    if not hum or char:GetAttribute("cantgetball") or char:GetAttribute("InMarble") then return end
-    if hasBall() or restricted(hum) then return end
-    local bp = ballPos()
-    if not bp or (hrp.Position - bp).Magnitude > fp.range then return end
-    lastPick = now
-    if not send("bytenet_findBall") and not findBallRemote() and not warned then
-        warned = true
-        warn("[zpost] pickup gagal: packet findBall nggak ketemu (require/remote nggak jalan di executor ini)")
+local parented = false
+for _, getP in ipairs({
+    function() return gethui and gethui() end,
+    function() return CoreGui end,
+    function() return Players.LocalPlayer:WaitForChild("PlayerGui", 10) end,
+}) do
+    local ok, p = pcall(getP)
+    if ok and p then
+        pcall(function() gui.Parent = p end)
+        if gui.Parent == p then parented = true break end
     end
 end
+if not parented then return warn("[zpost] gagal membuat GUI, tidak ada parent yang bisa dipakai") end
+cleanup[#cleanup + 1] = function() gui:Destroy() end
 
--- ===== AUTO POSITION =====
-local ap = { on = false, role = "CF", team = "A" }
-local ROLE_IDX = { CF = 1, LW = 2, RW = 3, CM = 4, GK = 5 }
-local wiki
-local function roleId(role)
-    if not wiki then
-        safe(function()
-            local w = RS:FindFirstChild("wiki", true)
-            if w then wiki = require(w) end
+-- drag + tap
+local function makeDraggable(handle, target, onTap)
+    local dragging, moved, startInput, startPos = false, false, nil, nil
+    track(handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragging, moved = true, false
+            startInput, startPos = input.Position, target.Position
+            local c
+            c = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    dragging = false
+                    c:Disconnect()
+                    if not moved and onTap then safe(onTap) end
+                end
+            end)
+        end
+    end))
+    track(UIS.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch) then
+            local d = input.Position - startInput
+            if d.Magnitude > 8 then moved = true end
+            if moved then
+                target.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+                    startPos.Y.Scale, startPos.Y.Offset + d.Y)
+            end
+        end
+    end))
+end
+
+-- window
+local W, H = IS_MOBILE and 400 or 460, IS_MOBILE and 250 or 300
+local main = new("Frame", {
+    Size = UDim2.fromOffset(W, H), AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5), BackgroundColor3 = C.bg,
+    BorderSizePixel = 0, ClipsDescendants = true,
+}, gui)
+corner(main, 10)
+new("UIStroke", { Color = Color3.fromRGB(60, 60, 78), Thickness = 1 }, main)
+
+local titleBar = new("Frame", { Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.title, BorderSizePixel = 0 }, main)
+new("TextLabel", {
+    Size = UDim2.new(1, -50, 1, 0), Position = UDim2.fromOffset(12, 0), BackgroundTransparency = 1,
+    Text = "K Hub  |  Azure Latch", TextXAlignment = Enum.TextXAlignment.Left,
+    Font = Enum.Font.GothamBold, TextSize = 13, TextColor3 = C.text,
+}, titleBar)
+local closeBtn = new("TextButton", {
+    Size = UDim2.fromOffset(32, 32), Position = UDim2.new(1, -32, 0, 0), BackgroundTransparency = 1,
+    Text = "—", Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = C.sub, AutoButtonColor = false,
+}, titleBar)
+track(closeBtn.Activated:Connect(function() main.Visible = false end))
+makeDraggable(titleBar, main)
+
+local tabList = new("ScrollingFrame", {
+    Size = UDim2.fromOffset(96, H - 40), Position = UDim2.fromOffset(6, 36),
+    BackgroundTransparency = 1, BorderSizePixel = 0, ScrollBarThickness = 0,
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(),
+}, main)
+new("UIListLayout", { Padding = UDim.new(0, 5) }, tabList)
+
+local content = new("Frame", {
+    Size = UDim2.fromOffset(W - 112, H - 42), Position = UDim2.fromOffset(106, 38), BackgroundTransparency = 1,
+}, main)
+
+-- UI object
+local UI = { Tabs = {} }
+local activeTab
+local function setActive(tab)
+    if activeTab then
+        activeTab.page.Visible = false
+        TweenService:Create(activeTab.btn, TweenInfo.new(0.15), { BackgroundColor3 = C.tab, TextColor3 = C.sub }):Play()
+    end
+    activeTab = tab
+    tab.page.Visible = true
+    TweenService:Create(tab.btn, TweenInfo.new(0.15), { BackgroundColor3 = C.accent, TextColor3 = Color3.new(1, 1, 1) }):Play()
+end
+
+function UI:AddTab(name)
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.tab, Text = name, AutoButtonColor = false,
+        Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = C.sub,
+    }, tabList)
+    corner(btn, 6)
+    local page = new("ScrollingFrame", {
+        Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+        ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        CanvasSize = UDim2.new(), Visible = false,
+    }, content)
+    new("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+    new("UIPadding", { PaddingRight = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6) }, page)
+
+    local tab = { btn = btn, page = page }
+
+    function tab:AddLabel(text)
+        return new("TextLabel", {
+            Size = UDim2.new(1, 0, 0, 22), BackgroundTransparency = 1, Text = text,
+            TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.Gotham,
+            TextSize = 12, TextColor3 = C.sub, TextWrapped = true,
+        }, page)
+    end
+
+    function tab:AddButton(text, callback)
+        local b = new("TextButton", {
+            Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = C.row, Text = text, AutoButtonColor = false,
+            Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = C.text,
+        }, page)
+        corner(b, 6)
+        track(b.Activated:Connect(function() if callback then safe(callback) end end))
+        return b
+    end
+
+    function tab:AddToggle(text, default, callback)
+        local state = default and true or false
+        local row = new("TextButton", {
+            Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = C.row, Text = "", AutoButtonColor = false,
+        }, page)
+        corner(row, 6)
+        new("TextLabel", {
+            Size = UDim2.new(1, -64, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+            Text = text, TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamMedium,
+            TextSize = 13, TextColor3 = C.text,
+        }, row)
+        local sw = new("Frame", {
+            Size = UDim2.fromOffset(38, 20), Position = UDim2.new(1, -48, 0.5, -10),
+            BackgroundColor3 = state and C.accent or C.off,
+        }, row)
+        corner(sw, 10)
+        local knob = new("Frame", {
+            Size = UDim2.fromOffset(16, 16), BackgroundColor3 = Color3.new(1, 1, 1),
+            Position = state and UDim2.fromOffset(20, 2) or UDim2.fromOffset(2, 2),
+        }, sw)
+        corner(knob, 8)
+
+        local obj = {}
+        local function render()
+            local ti = TweenInfo.new(0.15)
+            TweenService:Create(sw, ti, { BackgroundColor3 = state and C.accent or C.off }):Play()
+            TweenService:Create(knob, ti, { Position = state and UDim2.fromOffset(20, 2) or UDim2.fromOffset(2, 2) }):Play()
+        end
+        function obj:Set(v, silent)
+            state = v and true or false
+            render()
+            if not silent and callback then safe(callback, state) end
+        end
+        function obj:Get() return state end
+        track(row.Activated:Connect(function() obj:Set(not state) end))
+        return obj
+    end
+
+    -- tap untuk ganti opsi (tanpa dropdown, enak di layar sentuh)
+    function tab:AddCycle(text, options, default, callback)
+        local idx = table.find(options, default) or 1
+        local b
+        b = tab:AddButton(text .. ": " .. options[idx], function()
+            idx = idx % #options + 1
+            b.Text = text .. ": " .. options[idx]
+            if callback then callback(options[idx]) end
         end)
+        return b
     end
-    if wiki and type(wiki.teamroles) == "table" then
-        local i = table.find(wiki.teamroles, role)
-        if i then return math.clamp(i, 1, 5) end
+
+    -- tombol +/- (lebih gampang dari slider di layar sentuh)
+    function tab:AddStepper(text, min, max, step, default, callback)
+        local value = default
+        local row = new("Frame", { Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = C.row }, page)
+        corner(row, 6)
+        new("TextLabel", {
+            Size = UDim2.new(1, -130, 1, 0), Position = UDim2.fromOffset(10, 0), BackgroundTransparency = 1,
+            Text = text, TextXAlignment = Enum.TextXAlignment.Left, Font = Enum.Font.GothamMedium,
+            TextSize = 13, TextColor3 = C.text,
+        }, row)
+        local function mk(label, x)
+            local b = new("TextButton", {
+                Size = UDim2.fromOffset(28, 24), Position = UDim2.new(1, x, 0.5, -12),
+                BackgroundColor3 = C.tab, Text = label, AutoButtonColor = false,
+                Font = Enum.Font.GothamBold, TextSize = 16, TextColor3 = C.text,
+            }, row)
+            corner(b, 6)
+            return b
+        end
+        local minus, plus = mk("-", -118), mk("+", -34)
+        local lbl = new("TextLabel", {
+            Size = UDim2.fromOffset(52, 24), Position = UDim2.new(1, -88, 0.5, -12), BackgroundTransparency = 1,
+            Text = tostring(value), Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = C.sub,
+        }, row)
+        local obj = {}
+        function obj:Set(v, silent)
+            v = math.clamp(v, min, max)
+            v = tonumber(string.format("%.3f", math.floor(v / step + 0.5) * step))
+            value = v
+            lbl.Text = tostring(v)
+            if not silent and callback then safe(callback, v) end
+        end
+        function obj:Get() return value end
+        track(minus.Activated:Connect(function() obj:Set(value - step) end))
+        track(plus.Activated:Connect(function() obj:Set(value + step) end))
+        return obj
     end
-    return ROLE_IDX[role] or 1
+
+    track(btn.Activated:Connect(function() setActive(tab) end))
+    UI.Tabs[name] = tab
+    if not activeTab then setActive(tab) end
+    return tab
 end
-local function myState()
-    local chars = WS:FindFirstChild("characters")
-    local c = (chars and chars:FindFirstChild(LP.Name)) or LP.Character
-    return c and c:FindFirstChild("state")
+
+function UI.Unload()
+    cleanupAll()
+    genv.ZPOST_GUI = nil
 end
-local function myTeam()
-    local t = LP.Team
-    if t and t.Name ~= "" and t.Name ~= "lobby" and t.Name ~= "Spectators" then return t.Name end
-    local a = LP:GetAttribute("team")
-    if a and a ~= "" and a ~= "lobby" then return tostring(a) end
-    local st = myState()
-    local v = st and st:FindFirstChild("team")
-    if v and tostring(v.Value) ~= "" and tostring(v.Value) ~= "lobby" then return tostring(v.Value) end
-end
-local function myRole()
-    local st = myState()
-    local r = st and st:FindFirstChild("role")
-    return r and tostring(r.Value) or ""
-end
-local function roleTaken(role, team)
-    local chars = WS:FindFirstChild("characters")
-    if not chars then return false end
-    for _, c in ipairs(chars:GetChildren()) do
-        if c.Name ~= LP.Name then
-            local st = c:FindFirstChild("state")
-            local t = st and st:FindFirstChild("team")
-            local r = st and st:FindFirstChild("role")
-            if r and tostring(r.Value) == role and tostring(t and t.Value) == team then return true end
+
+-- tabs
+local tMain = UI:AddTab("Main")
+local tVisual = UI:AddTab("Visual")
+
+-- ============================================================
+-- FITUR: Fast Auto-Pickup + Auto Position
+-- ============================================================
+do
+    local RS = game:GetService("ReplicatedStorage")
+    local WS = game:GetService("Workspace")
+    local RunService = game:GetService("RunService")
+    local LP = Players.LocalPlayer
+
+    local alive = true
+    cleanup[#cleanup + 1] = function() alive = false end
+
+    -- ===== packets =====
+    local packets
+    local function getPackets()
+        if packets then return packets end
+        safe(function()
+            local m = RS:FindFirstChild("packets") or RS:FindFirstChild("packets", true)
+            if not m then return end
+            local r = require(m)
+            if type(r) == "table" and (r.bytenet_findBall or r.bytenet_selectRole) then packets = r end
+        end)
+        return packets
+    end
+    local function send(name, ...)
+        local p = getPackets()
+        local pk = p and p[name]
+        if not pk then return false end
+        local a = table.pack(...)
+        if pcall(function() pk.send(table.unpack(a, 1, a.n)) end) then return true end
+        return (pcall(function() pk:send(table.unpack(a, 1, a.n)) end))
+    end
+    local function findBallRemote() -- fallback kalau require nggak jalan
+        local r = RS:FindFirstChild("ByteNetReliable") or RS:FindFirstChild("Reliable", true)
+        if not r or not buffer then return false end
+        local id = 29
+        safe(function()
+            local s = RS:FindFirstChild("BytenetStorage")
+            local n = s and s:FindFirstChild("Networking")
+            local d = n and game:GetService("HttpService"):JSONDecode(n.Value)
+            if d and d.packets and d.packets.bytenet_findBall then id = d.packets.bytenet_findBall end
+        end)
+        return (pcall(function() r:FireServer(buffer.fromstring(string.char(id))) end))
+    end
+
+    -- ===== helpers =====
+    local function hasBall()
+        local w = RS:FindFirstChild("workspace")
+        local holder = w and w:FindFirstChild("ballHolder")
+        if holder and holder.Value and holder.Value == LP.Character then return true end
+        local chars = WS:FindFirstChild("characters")
+        local c = chars and chars:FindFirstChild(LP.Name)
+        return c ~= nil and (c:FindFirstChild("Ball") ~= nil or c:FindFirstChild("AlternateBallRig") ~= nil)
+    end
+    local function ballPos()
+        local cf = RS:FindFirstChild("CFBall")
+        if cf and cf:IsA("CFrameValue") then return cf.Value.Position end
+        local t = WS:FindFirstChild("Terrain")
+        local b = (t and (t:FindFirstChild("Ball") or t:FindFirstChild("MarbleStuckBall"))) or WS:FindFirstChild("Ball")
+        if b and b:IsA("BasePart") then return b.Position end
+    end
+
+    -- ===== FAST AUTO-PICKUP =====
+    local MAX_RANGE = 15
+    local fp = { on = false, show = false, range = 12 }
+    local RESTRICTED = {
+        ["81249694116204"] = true, ["115839777221212"] = true, ["127428631641330"] = true,
+        ["97586424269981"] = true, ["133565559497234"] = true, ["79074253499106"] = true,
+    }
+    local function restricted(hum)
+        local an = hum:FindFirstChildOfClass("Animator")
+        if not an then return false end
+        for _, tr in ipairs(an:GetPlayingAnimationTracks()) do
+            local id = tr.Animation and tostring(tr.Animation.AnimationId):match("%d+")
+            if id and RESTRICTED[id] then return true end
+        end
+        return false
+    end
+
+    local ring = Instance.new("Part")
+    ring.Anchored, ring.CanCollide, ring.CanQuery, ring.CanTouch = true, false, false, false
+    ring.Shape, ring.Material, ring.Transparency = Enum.PartType.Cylinder, Enum.Material.Neon, 1
+    ring.Color, ring.Size = Color3.fromRGB(70, 190, 255), Vector3.new(0.1, 1, 1)
+    ring.Parent = WS
+    cleanup[#cleanup + 1] = function() ring:Destroy() end
+
+    local lastPick, warned = 0, false
+    local function pickupStep()
+        local char = LP.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp and fp.show then
+            local d = fp.range * 2
+            ring.Size = Vector3.new(0.1, d, d)
+            ring.CFrame = CFrame.new(hrp.Position - Vector3.new(0, 3.2, 0)) * CFrame.Angles(0, 0, math.rad(90))
+            ring.Transparency = 0.75
+        else
+            ring.Transparency = 1
+        end
+        if not fp.on or not hrp then return end
+        local now = os.clock()
+        if now - lastPick < 0.08 + math.random() * 0.02 then return end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not hum or char:GetAttribute("cantgetball") or char:GetAttribute("InMarble") then return end
+        if hasBall() or restricted(hum) then return end
+        local bp = ballPos()
+        if not bp or (hrp.Position - bp).Magnitude > fp.range then return end
+        lastPick = now
+        if not send("bytenet_findBall") and not findBallRemote() and not warned then
+            warned = true
+            warn("[zpost] pickup gagal: packet findBall nggak ketemu (require/remote nggak jalan di executor ini)")
         end
     end
-    return false
-end
-local function clickGui(role, team)
-    if not firesignal then return false end
-    local clicked = false
-    safe(function()
-        local pg = LP:FindFirstChild("PlayerGui")
-        local sel = pg and pg:FindFirstChild("Select")
-        local frame = sel and sel:FindFirstChild("Frame")
-        local cont = frame and (frame:FindFirstChild(team) or frame:FindFirstChild("Team" .. team))
-        local rf = cont and cont:FindFirstChild(role)
-        if not rf then return end
-        local btn = rf:FindFirstChild("Button") or rf:FindFirstChildWhichIsA("GuiButton")
-            or (rf:IsA("GuiButton") and rf or nil)
-        if not btn then return end
-        for _, sig in ipairs({ "MouseButton1Up", "MouseButton1Click", "Activated" }) do
-            pcall(function() firesignal(btn[sig]) end)
+
+    -- ===== AUTO POSITION =====
+    local ap = { on = false, role = "CF", team = "A" }
+    local ROLE_IDX = { CF = 1, LW = 2, RW = 3, CM = 4, GK = 5 }
+    local wiki
+    local function roleId(role)
+        if not wiki then
+            safe(function()
+                local w = RS:FindFirstChild("wiki", true)
+                if w then wiki = require(w) end
+            end)
         end
-        clicked = true
-    end)
-    return clicked
-end
-local function pickRole(role, team)
-    if clickGui(role, team) then return end
-    send("bytenet_selectRole", { index = roleId(role), t = team })
-end
-
-local lastSel = 0
-local function selectStep()
-    if not ap.on then return end
-    local now = os.clock()
-    if now - lastSel < 0.4 then return end
-    local team = myTeam()
-    if myRole() == ap.role and ((ap.team == "Both" and (team == "A" or team == "B")) or team == ap.team) then return end
-    lastSel = now
-    if ap.team == "Both" then
-        if not roleTaken(ap.role, "A") then pickRole(ap.role, "A")
-        elseif not roleTaken(ap.role, "B") then pickRole(ap.role, "B") end
-    elseif not roleTaken(ap.role, ap.team) then
-        pickRole(ap.role, ap.team)
+        if wiki and type(wiki.teamroles) == "table" then
+            local i = table.find(wiki.teamroles, role)
+            if i then return math.clamp(i, 1, 5) end
+        end
+        return ROLE_IDX[role] or 1
     end
-end
-
-local hb = RunService.Heartbeat:Connect(function() safe(pickupStep) end)
-cleanup[#cleanup + 1] = function() hb:Disconnect() end
-
-local c1 = LP.CharacterAdded:Connect(function() task.wait(0.3) selectStep() end)
-cleanup[#cleanup + 1] = function() c1:Disconnect() end
-local pg = LP:FindFirstChild("PlayerGui")
-if pg then
-    local c2 = pg.ChildAdded:Connect(function(ch)
-        if ch.Name == "Select" then task.wait(0.05) selectStep() end
-    end)
-    cleanup[#cleanup + 1] = function() c2:Disconnect() end
-end
-task.spawn(function()
-    while alive do
-        safe(selectStep)
-        task.wait(0.4 + math.random() * 0.1)
+    local function myState()
+        local chars = WS:FindFirstChild("characters")
+        local c = (chars and chars:FindFirstChild(LP.Name)) or LP.Character
+        return c and c:FindFirstChild("state")
     end
-end)
-
--- ===== UI =====
-local t = UI:AddTab("Evo")
-cleanup[#cleanup + 1] = function() t.btn:Destroy() t.page:Destroy() end
-t:AddLabel("FAST AUTO-PICKUP")
-t:AddToggle("Fast Auto-Pickup", false, function(v) fp.on = v end)
-t:AddToggle("Show Range", false, function(v) fp.show = v end)
-t:AddStepper("Pickup Range", 5, MAX_RANGE, 0.5, 12, function(v) fp.range = math.min(v, MAX_RANGE) end)
-t:AddLabel("AUTO POSITION")
-t:AddToggle("Auto Choose", false, function(v) ap.on = v end)
-t:AddCycle("Role", { "CF", "CM", "LW", "RW", "GK" }, "CF", function(v) ap.role = v end)
-t:AddCycle("Team", { "A", "B", "Both" }, "A", function(v) ap.team = v end)
-t:AddButton("Unload Evo", unload)
+    local function myTeam()
+        local t = LP.Team
+        if t and t.Name ~= "" and t.Name ~= "lobby" and t.Name ~= "Spectators" then return t.Name end
+        local a = LP:GetAttribute("team")
+        if a and a ~= "" and a ~= "lobby" then return tostring(a) end
+        local st = myState()
+        local v = st and st:FindFirstChild("team")
+        if v and tostring(v.Value) ~= "" and tostring(v.Value) ~= "lobby" then return tostring(v.Value) end
+    end
+    local function myRole()
+        local st = myState()
+        local r = st and st:FindFirstChild("role")
+        return r and tostring(r.Value) or ""
+    end
+    local function roleTaken(role, team)
+        local chars = WS:FindFirstChild("characters")
+        if not chars then return false end
+        for _, c in ipairs(chars:GetChildren()) do
+            if c.Name ~= LP.Name then
+                local st = c:FindFirstChild("state")
+                local t = st and st:FindFirstChild("team")
+                local r = st and st:FindFirstChild("role")
+                if r and tostring(r.Value) == role and tostring(t and t.Value) == team then return true end
+            end
+        end
+        return false
+    end
+    local function clickGui(role, team)
+        if not firesignal then return false end
+        local clicked = false
+        safe(function()
+            local pg = LP:FindFirstChild("PlayerGui")
+            local sel = pg and pg:FindFirstChild("Select")
+            local frame = sel and sel:FindFirstChild("Frame")
+            local cont = frame and (frame:FindFirstChild(team) or frame:FindFirstChild("Team" .. team))
+            local rf = cont and cont:FindFirstChild(role)
+            if not rf then return end
+            local btn = rf:FindFirstChild("Button") or rf:FindFirstChildWhichIsA("GuiButton")
+                or (rf:IsA("GuiButton") and rf or nil)
+            if not btn then return end
+            for _, sig in ipairs({ "MouseButton1Up", "MouseButton1Click", "Activated" }) do
+                pcall(function() firesignal(btn[sig]) end)
+            end
+            clicked = true
+        end)
+        return clicked
+    end
+    local function pickRole(role, team)
+        if clickGui(role, team) then return end
+        send("bytenet_selectRole", { index = 
